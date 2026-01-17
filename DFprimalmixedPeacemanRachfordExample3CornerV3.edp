@@ -1,0 +1,427 @@
+//
+// This code solves the primal-mixed Darcy-Forchheimer problem 
+// using a Peaceman-Rachford method proposed by Girault and Wheeler [1]
+// It corresponds to Example 3 in paper [2]
+//
+// Author: Hiram Varela Rodriguez
+// Date (last modification): January 15, 2026
+//
+//
+verbosity = 0; 
+real cpu = clock();
+// PROBLEM PARAMETERS:
+// 
+real rho = 1.0; // fluid density
+real mu = 1.0;  // fluid viscosity
+real k1 = 1.0, k2 = 1.0;  // k1, k2: diagonal entries of the permeability tensor
+real beta = 1.0; // Forchheimer parameter
+//
+// METHOD PARAMETERS: 
+//
+// Set method = 1 for an adaptive refinement, set any other value for a uniform refinement
+int method = 1;  
+// alfa: parameter to enhance convergence; 
+//       the best choice is between 1.2 and 4.0 for this example.
+real alfa = 3.5; 
+int i, j; // loop indices
+int n = 10; // number of elements for each side
+real hmax1; // maximum mesh size
+//
+// ERRORS
+//
+// errP: Exact error in the pressure variable in W^{1,3/2}-norm  
+// errU: Exact error in the velocity variable in L^3 norm
+// errTotal: Total exact error
+//
+// errAbs: Approximation of absolute error in the W^{1,3/2}-norm for the pressure and L^3-norm for the velocity
+// errorNp1: Norm of the approximate solution (W^{1,3/2} for the pressure and L^3 for the velocity)
+//
+real errP, errU, errTotal;
+real errAbs, errNp1; errAbs = 100.0; errNp1 = 1.0;
+//
+// RATES
+// 
+// rU1, rU2: absolute error in velocity in two consecutive meshes
+// rP1, rP2: absolute error in pressure in two consecutive meshes
+// rT1, rT2: absolute total error in two consecutive meshes
+// ndof1, ndof2: number of degrees of freedom for two consecutive meshes
+//
+// rUcout: rate of convergence in velocity
+// rPcout: rate of convergence in pressure
+// rTcout: rate of convergence on the total error
+//
+real rU1, rU2, rP1, rP2, rT1, rT2, ndof1, ndof2, rUcout, rPcout, rTcout; 
+//
+// rI1, rI2: values of the indicator in two consecutive meshes
+// rIcout: rate of convergence of the error indicator
+// qu: ratio of number of freedoms in two consecutive meshes
+//
+real rI1, rI2, rIcout, qu; 
+
+//
+// MACROS:
+//
+//// BEGINNING OF MACRO 1
+
+ macro MeshSizecomputation (Th, Vh, h)
+ {
+ real[int] count(Th.nv);
+ /*mesh size (lenEdge = integral(e) 1 ds)*/
+ varf vmeshsizen (u, v) = intalledges(Th, qfnbpE=2)(v);  
+ /*number of edges per vertex*/
+ varf vedgecount (u, v) = intalledges(Th, qfnbpE=2)(v/lenEdge); 
+ /*mesh size*/
+ count = vedgecount(0, Vh);
+ h[] = 0.;
+ h[] = vmeshsizen(0, Vh);
+ cout << "count min = " << count.min << " max = " << count.max << endl;
+ h[] = h[]./count;
+ cout << "-- bound meshsize = " << h[].min << " " << h[].max << endl;
+ }//
+ 
+ //// END OF MACRO 1
+ 
+ ////  BEGINNING OF MACRO 2
+ 
+ macro ReMeshIndicator (Th, Ph, Vh, vindicator, coef)
+ {
+ Vh h=0;
+ /*evaluate the mesh size*/
+ MeshSizecomputation(Th, Vh, h);
+ Ph etak;
+ etak[] = vindicator(0, Ph);
+ etak[] = sqrt(etak[]);
+ real etastar= coef*(etak[].sum/etak[].n);
+ cout << "etastar = " << etastar << " sum = " << etak[].sum << " " << endl;
+
+ /*etaK is discontinous*/
+ /*we use P1 L2 projection with mass lumping*/
+ Vh fn, sigma;
+ varf veta(unused, v) = int2d(Th)(etak*v);
+ varf vun(unused, v) = int2d(Th)(1.*v);
+ fn[] = veta(0, Vh);
+ sigma[] = vun(0, Vh);
+ fn[] = fn[]./ sigma[];
+ fn = max(min(fn/etastar,3.),0.3333); 
+ /*  fn = max(min(fn/etastar,3.),0.3333); */
+ 
+ /*new mesh size*/
+ h = h / fn;
+ /*build the mesh*/
+ Th = adaptmesh(Th, IsMetric=1, h*0.8, splitpbedge=2, nbvx=1500000); 
+ }//
+ //// END OF MACRO 2
+//
+// END OF MACROS
+//
+// 
+// Definition of the domain: the unit square
+//
+border c1 (t=0,1) {x = t; y = 0; label = 1;}
+border c2 (t=0,1) {x = 1; y = t; label = 2;}
+border c3 (t=1,0) {x = t; y = 1; label = 3;}
+border c4 (t=1,0) {x = 0; y = t; label = 4;}
+//
+// Plot the domain
+//
+plot(c1(n) + c2(n) + c3(n) + c4(n), wait = 0, ps="domain.eps");
+//
+// Define the mesh
+//
+mesh Th = square(n,n);
+//
+// Plot the actual mesh
+//
+plot(Th, wait = 1);
+// Compute maximum mesh size
+hmax1 = Th.hmax;
+//
+// Definte finite element spaces
+//
+// Ah : finite element space for velocity
+//
+fespace Ah(Th,P0); 
+//
+// Define variables in Ah:
+// u1, u2: velocity vector
+// v1, v2: test functions for vlelocity
+// u1old, u2old: velocity approximation at previous iteration
+// gamma, F1, F2: variables required in Peaceman-Rachford type method 
+// u105, u205: intermediate approximation for the velocity in the actual step
+// g1P0, g2P0: P0-projection of the datum g
+// u1P0, u2P0: P0-projection of the velocity
+// fP0: P0-projection of datum f
+//
+Ah u1, u2, v1, v2, u1old, u2old, gamma, F1, F2, u105, u205, g1P0, g2P0, u1P0, u2P0, fP0;  
+//
+//	Bh : finite element space for pressure
+//
+fespace Bh(Th, P1); 
+//
+// Define variables in Bh:
+//
+// p: fluid pressure
+// q: test function for the pressure
+// pOld: fluid pressure approximation at the previous step
+//
+Bh p,q, pOld;
+//
+// Finite element spaces required for the adaptive refinement in macros
+//
+fespace Vh(Th,P1); // Vh must be a P1 space
+fespace Ph(Th,P0); 
+fespace Teh(Th,P0); // Teh should be P0
+Teh chiK; // Characteristic function of element K   
+//
+// MANUFACTURED SOLUTION:
+//
+// Exact velocity
+//
+func u1real =  (x*x - x)*(2.*y - 1.);
+func u2real = -(y*y - y)*(2.*x - 1.);
+//
+// Exact pressure		
+//
+real desf = 1.01;
+func pReal = -mu*log(sqrt( (x-desf)^2. + (y-desf)^2.));
+//
+// Partial derivatives of the exact pressure
+//
+func pRealDERx = -mu*(x-desf) / ( (x-desf)^2. + (y-desf)^2. );
+func pRealDERy = -mu*(y-desf) / ( (x-desf)^2. + (y-desf)^2. );
+//
+// f = divergece(u1,u2)
+//		 
+func f = 0.0;
+//
+// [g1,g2] = LHS
+// 	  
+func g1 = mu*k1*u1real + beta*rho*sqrt(u1real^2. + u2real^2.)*u1real + pRealDERx;
+func g2 = mu*k2*u2real + beta*rho*sqrt(u1real^2. + u2real^2.)*u2real + pRealDERy;
+//
+// P0-projection of data 
+//
+fP0 = f;
+g1P0 = g1;
+g2P0 = g2;
+//
+//
+// ERROR INDICATOR
+//
+varf indicator2 (unused, chiK)
+ =
+ intalledges(Th)(0.5*(hTriangle^(-2./3.)+hTriangle^(1./3.))*(nTonEdge - 1)*chiK*  1.0 * lenEdge  *square(jump(u1*N.x + u2*N.y)));
+ // Power 2/3 of L^{3/2}-norm
+ int2d(Th)(chiK * abs(mu*k1*u1 + beta*rho*sqrt(u1*u1+u2*u2)*u1 - rho*g1 + dx(p)) +
+           chiK * abs(mu*k2*u2 + beta*rho*sqrt(u1*u1+u2*u2)*u2 - rho*g2 + dy(p))) 
+ // Power 3/4 of L^{3/2}-norm
+ +int2d(Th)(chiK* sqrt(abs(mu*k1*u1 + beta*rho*sqrt(u1*u1+u2*u2)*u1 - rho*g1 + dx(p))) +
+            chiK* sqrt(abs(mu*k2*u2 + beta*rho*sqrt(u1*u1+u2*u2)*u2 - rho*g2 + dy(p))))+
+ // L^{3/2}-norm
+ int2d(Th)(chiK* sqrt(abs(mu*k1*u1 + beta*rho*sqrt(u1*u1+u2*u2)*u1 - rho*g1 + dx(p)))^3 +
+           chiK* sqrt(abs(mu*k2*u2 + beta*rho*sqrt(u1*u1+u2*u2)*u2 - rho*g2 + dy(p)))^3)+
+ // Power 1/2 of L^{3/2}-norm
+ int2d(Th)(chiK* abs(mu*k1*u1 + beta*rho*sqrt(u1*u1+u2*u2)*u1 - rho*g1 + dx(p))^(3./4.) +
+           chiK* abs(mu*k2*u2 + beta*rho*sqrt(u1*u1+u2*u2)*u2 - rho*g2 + dy(p))^(3./4.))+
+ //
+ int2d(Th)(chiK * abs(dx(u1) + dy(u2) - f)^3) + 	 
+ int2d(Th)(chiK * square(dx(u1) + dy(u2) - f)) + 	 
+ int2d(Th)(chiK * abs(dx(u1) + dy(u2) - f)^(1./4.)) + 	 
+ int2d(Th)(chiK * abs(dx(u1) + dy(u2) - f)^(3./2.)) +
+ // 	 
+ intalledges(Th)( 0.5*(hTriangle^(-2./3.)+hTriangle^(1./3.))*(nTonEdge - 1.0)*chiK*lenEdge*abs(jump(u1*N.x + u2*N.y))^3) +
+ intalledges(Th)( 0.5*(hTriangle^(-2./3.)+hTriangle^(1./3.))*(nTonEdge - 1.0)*chiK*square(jump(u1*N.x + u2*N.y))) +
+ intalledges(Th)( 0.5*(hTriangle^(-2./3.)+hTriangle^(1./3.))*(nTonEdge - 1.0)*chiK*abs(jump(u1*N.x + u2*N.y))^(1./4.)) +
+ intalledges(Th)( 0.5*(hTriangle^(-2./3.)+hTriangle^(1./3.))*(nTonEdge - 1.0)*chiK*abs(jump(u1*N.x + u2*N.y))^(3./2.)) +
+ intalledges(Th)((2-nTonEdge)*(hTriangle^(-2./3.)+hTriangle^(1./3.))*chiK*(abs(u1*N.x + u2*N.y))^3) +
+ intalledges(Th)((2-nTonEdge)*(hTriangle^(-2./3.)+hTriangle^(1./3.))*chiK*square(u1*N.x + u2*N.y))+
+ intalledges(Th)((2-nTonEdge)*(hTriangle^(-2./3.)+hTriangle^(1./3.))*chiK*abs(u1*N.x + u2*N.y)^(1./4.))+
+ intalledges(Th)((2-nTonEdge)*(hTriangle^(-2./3.)+hTriangle^(1./3.))*chiK*abs(u1*N.x + u2*N.y)^(3./2.));
+//
+// END OF ERROR INDICATOR
+//
+//
+// INITIALIZATION: SOLVING the Darcy linear problem
+//
+solve Darcy(u1, u2, p, v1, v2, q, solver = UMFPACK) 
+= 		
+int2d(Th)(mu*k1*u1*v1 + mu*k2*u2*v2)
++ int2d(Th)(dx(p)*v1 + dy(p)*v2)		
+- int2d(Th)(g1P0*v1 + g2P0*v2)
++ int2d(Th)(u1*dx(q) + u2*dy(q))
++ int2d(Th)(f*q)
+- int1d(Th,1,2,3,4)(q*(u1real*N.x + u2real*N.y))			
+- int2d(Th)(p*q*1e-7); // added to satisfy the zero mean condition on the pressure
+//
+// Plotting the initial approximation to the solution
+//
+plot([u1, u2], wait = 1);
+plot(p, fill = 1, wait = 1);	
+// 
+// END OF INITIALITATION
+//
+//
+// START OF ITERATIVE LOOP
+//
+real sumt; // Total number of degrees of freedom
+//
+for( i=1; i<=20; i++) // EXTERIOR LOOP (i) BEGINS HERE 
+{ 
+	sumt = Ah.ndof + Bh.ndof;  
+	cout << " Total DOF = " << sumt << endl; wait = 0;
+	
+	if (sumt > 1.2e6) {
+		cout << " End of program (too much memory needed)" << endl;
+		exit(0);
+	}
+
+   for( j=1; j<150; j++) // INNER LOOP (j) BEGINS HERE
+   {
+   	// FIRST STEP: we solve a nonlinear problem; 
+      //             since g1, g2 are piecewise constant, the solution can be obtained explicitly
+      F1 = (1./alfa)*u1 - mu*k1*u1 - dx(p) + g1P0;   
+      F2 = (1./alfa)*u2 - mu*k2*u2 - dy(p) + g2P0;   
+      gamma = 1./(2.*alfa) + 0.5* sqrt(1./(alfa^2.) + 4.*beta*rho*sqrt(F1^2. + F2^2.)); 
+      u105 = (1./gamma)*F1;
+      u205 = (1./gamma)*F2;  
+      //
+      // SECOND STEP: we solve a linear coupled problem
+      //
+	   solve DarcyForchheimerPRIMAL(u1, u2, p, v1, v2, q, solver = UMFPACK) 
+      = 
+      int2d(Th)((1./alfa)*u1*v1 + (1./alfa)*u2*v2)
+      - int2d(Th)((1./alfa)*u105*v1 + (1./alfa)*u205*v2)
+      + int2d(Th)(mu*k1*u1*v1 + mu*k2*u2*v2)
+		+ int2d(Th)(dx(p)*v1 + dy(p)*v2)
+		- int2d(Th)(g1P0*v1 + g2P0*v2)
+		+ int2d(Th)(beta*rho*sqrt(u105^2. + u205^2.)*u105*v1 + beta*rho*sqrt(u105^2. + u205^2.)*u205*v2)			
+      + int2d(Th)(u1*dx(q) + u2*dy(q))
+		+ int2d(Th)(q*f)
+		- int1d(Th,1,2,3,4)(q*( u1real*N.x + u2real*N.y ))	
+      - int2d(Th) (p*q*1e-7); // added to ensure the zero mean pressure	condition
+      //
+      // Plot the approximation of the solution at the actual step
+      // wait = 1 causes a pause
+      plot([u1, u2], wait = 0);
+      plot(p, fill = 1, wait = 0);	
+      //
+      if(j == 1) {
+      	pOld = p; u1old = u1; u2old = u2;
+      } 
+      else {
+      	errAbs = (int2d(Th)((abs(dx(p)-dx(pOld)))^(3./2.)) + int2d(Th)((abs(dy(p)-dy(pOld)))^(3./2.)) )^(2./3.) + (int2d(Th)((abs(u1 - u1old))^3.))^(1./3.) + (int2d(Th)((abs(u2 - u2old))^3.))^(1./3.);
+      	errNp1 = (int2d(Th)(abs(dx(p))^(3./2.)) + int2d(Th)((abs(dy(p)))^(3./2.)))^(2./3.) + (int2d(Th)((abs(u1))^3.))^(1./3.) + (int2d(Th)((abs(u2))^3.))^(1./3.);
+
+			pOld = p; u1old = u1; u2old = u2;
+
+	   };
+
+		errP = (int2d(Th)(abs(dx(p) - pRealDERx)^(3./2.)) + int2d(Th)(abs(dy(p) - pRealDERy)^(3./2.)) )^(2./3.);
+		errU = (int2d(Th)((abs(u1 - u1real))^3.) + int2d(Th)((abs(u2 - u2real))^3.))^(1./3.); 
+		errTotal = errP + errU;
+
+   	cout << " Approximate absolute error = " << errAbs << "\n"; wait = 0;
+	   //
+	   // STOPING CRITERION (based on relative error test)
+	   //
+	   if (errAbs < 1e-5*errNp1) {
+	   	cout << " \n\n *** Number of Peaceman-Rachford iterations: " << j <<"\n"; 
+	  		cout << " \n\n Approximate absolute error = " << errAbs << " Norm of the solution = "<< errNp1 <<"\n"; 
+
+			if (i == 1){
+				rU1 = errU; rP1 = errP; rT1 = errTotal; ndof1 = sumt; 
+				} 
+			else {
+				rU2 = errU; rP2 = errP; rT2 = errTotal; ndof2 = sumt;
+			   rUcout = -2.*(  log(rU2/rU1) / log(ndof2/ndof1)  );
+				rPcout = -2.*(  log(rP2/rP1) / log(ndof2/ndof1)  );
+				rTcout = -2.*(  log(rT2/rT1) / log(ndof2/ndof1)  );
+				rU1 = rU2; rP1 = rP2; rT1 = rT2; qu = ndof2/ndof1; ndof1 = ndof2; 
+			};
+			break;
+		};
+	} // END OF INNER LOOP (j)
+   //
+	// INDICATOR AND RESULTS
+	//
+	real qwe, qwe1, qwe2, qwe3, qwe4;
+	//
+	// Indicator for the momentum equation
+	//
+	qwe1 = (int2d(Th)(1.0* abs(mu*k1*u1 + beta*rho*sqrt(u1*u1+u2*u2)*u1 + dx(p) - rho*g1)^(3./2.) +
+   	                1.0* abs(mu*k2*u2 + beta*rho*sqrt(u1*u1+u2*u2)*u2 + dy(p) - rho*g2)^(3./2.))      )^(2./3.);
+	//
+	// Indicator for the mass balance equation
+	//					 
+	qwe2 = (int2d(Th)(1.0 * abs(dx(u1) + dy(u2) - f)^3.)  )^(1./3.);
+	//
+	// Velocity jumps
+	//	
+	qwe3 = (intalledges(Th)((hTriangle^(-2./3.)+hTriangle^(1./3.))*0.5*(nTonEdge - 1.0)*1.0*abs(jump(u1*N.x + u2*N.y))^3.)  )^(1./3.);
+	//
+	// Boundary error indicator
+	//	
+	qwe4 = (int1d(Th)((hTriangle^(-2./3.)+hTriangle^(1./3.))*1.0 * abs((u1-u1real)*N.x + (u2-u2real)*N.y)^3.)  )^(1./3.);
+	//
+	// Total error indicator
+	//	
+	qwe = qwe1 + sqrt(qwe1) + qwe1^(2./3.) +qwe1^(3./4.) + qwe2 + sqrt(qwe2) + qwe2^(2./3.) + qwe2^(3./4.) + qwe3 + sqrt(qwe3) + qwe3^(2./3.) + qwe3^(3./4.) + qwe4 + sqrt(qwe4) + qwe4^(2./3.) + qwe4^(3./4.);
+	//
+	//
+	//
+	if(i == 1){
+		rI1 = qwe;
+	} 
+	else{
+		rI2 = qwe; 
+		rIcout = -2.*(log(rI2/rI1)/log(qu));
+		rI1 = rI2;
+	}
+	//
+	// OUTPUT
+	//
+	cout << " _____________________________________________________________________________________________\n";
+	cout << " _____________________________________________________________________________________________\n";
+	cout << "    Table of errors \n\n";
+	cout << "    ||p||_L2                 ||u||_X                 TOTAL error \n\n";
+	cout << "    " << errP <<"                 "<< errU << "               " <<errTotal<<"\n";
+	cout << "    r_P = "<<rPcout<<"            r_U = "<<rUcout<<"          r_T = "<<rTcout<<" \n\n";
+	cout << "    DOF = "<<sumt<<"  hmax = "<<hmax1<<" \n\n";
+	cout << "    Indicator:  "<< qwe << "---   \n\n";
+	cout << "    Indicator rate:      " << rIcout << " --- \n\n";
+	cout << " _____________________________________________________________________________________________\n";
+	//
+	errAbs = 100.0; errNp1 = 1.0;
+	//
+	// Plot final solution
+	//
+	plot(p, wait = 0);
+	plot([u1, u2], wait = 0);
+	//
+	// Plot the final mesh
+	// 
+	plot(Th, wait = 0, ps="mesh__Example_3_corner_sing_"+i+".eps");
+	//
+	if (method == 1){ // Adaptive FEM
+   	real cc = 0.8;  // parameter to adjust the mesh refinement
+   	if (i > 5) cc=1;
+   	ReMeshIndicator(Th, Ph, Vh, indicator2, cc); 
+   	hmax1 = Th.hmax;
+		plot(Th, wait = 0);
+		}
+	else { // Uniform refinement
+   	n = n*2;
+   	Th = square(n,n);
+		hmax1 = Th.hmax;
+		plot(Th, wait = 0);
+	}
+	// 
+	u1 = u1; u2 = u2; p = p;
+	fP0 = f;
+	g1P0 = g1;
+	g2P0 = g2;
+} // END OF EXTERIOR LOOP (i)
+
+cout << "CPU time = " << (clock()-cpu) << endl;
+cout << " --------------- End of Program ---------------  \n\n";
+
